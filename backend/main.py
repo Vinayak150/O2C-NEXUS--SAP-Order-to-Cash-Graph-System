@@ -34,10 +34,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="SAP O2C Graph API", lifespan=lifespan)
 
-# CORS Configuration
+# CORS — add your Vercel URL to ALLOWED_ORIGINS env var (comma-separated)
+_raw_origins = os.getenv(
+    "ALLOWED_ORIGINS",
+    "http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173",
+)
+_allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173"],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

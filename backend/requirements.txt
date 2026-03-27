@@ -4,3 +4,4 @@ python-multipart
 networkx
 google-generativeai
 pydantic
+python-dotenv
