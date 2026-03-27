@@ -35,6 +35,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="SAP O2C Graph API", lifespan=lifespan)
 
+# CORS setup is perfect. allow_credentials MUST be False when allow_origins is ["*"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -43,10 +44,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# FIXED: Added a Root Route so you don't get {"detail":"Not Found"} anymore!
+@app.get("/")
+def read_root():
+    return {"status": "System Online", "message": "Backend is running perfectly!"}
+
+# FIXED: Added double-routes to catch requests with or without "/api"
+@app.get("/graph")
 @app.get("/api/graph")
 def get_graph():
     return GRAPH_DATA
 
+@app.get("/graph/node/{node_id}")
 @app.get("/api/graph/node/{node_id}")
 def get_node(node_id: str):
     for node in GRAPH_DATA.get("nodes", []):
@@ -54,6 +63,7 @@ def get_node(node_id: str):
             return node
     raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found")
 
+@app.get("/stats")
 @app.get("/api/stats")
 def get_stats():
     conn = get_db()
@@ -82,6 +92,7 @@ class ChatRequest(BaseModel):
     message: str
     chat_history: Optional[List[Dict[str, str]]] = []
 
+@app.post("/chat")
 @app.post("/api/chat")
 def chat(request: ChatRequest):
     try:
@@ -94,6 +105,7 @@ def chat(request: ChatRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
+@app.get("/api/health")
 def health():
     return {
         "status": "ok",
