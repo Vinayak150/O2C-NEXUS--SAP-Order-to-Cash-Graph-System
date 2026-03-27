@@ -1,114 +1,138 @@
-# SAP O2C Graph System
+# O2C Nexus: SAP S/4HANA Order-to-Cash AI Dashboard
 
-A full-stack graph visualization and natural language query system for SAP Order-to-Cash data. Explore the complete O2C flow — from Sales Order through Delivery, Billing, Journal Entry, and Payment — as an interactive force-directed graph, then query it in plain English powered by Gemini.
+> An interactive graph intelligence platform for analysing real SAP S/4HANA transactional data — built for portfolio demonstration and enterprise knowledge transfer.
 
-## Stack
+---
 
-| Layer | Choice | Why |
-|-------|--------|-----|
-| Backend | FastAPI (Python) | Fast API dev, great async support |
-| Database | SQLite | Zero setup, portable, sufficient for this scale |
-| Graph Engine | NetworkX (in-memory) | Best Python graph library for analysis |
-| Frontend | React + Vite + TypeScript | Fast build, modern DX |
-| Graph Viz | react-force-graph-2d | Force-directed, performant canvas rendering |
-| LLM | Google Gemini 2.0 Flash | Free tier generous, fast, structured JSON output |
+## Overview
 
-## Setup
+O2C Nexus ingests a real SAP S/4HANA Order-to-Cash dataset, models it as a directed property graph using NetworkX, and exposes it through a force-directed React dashboard with an embedded Groq-powered AI chat interface. Users can visually explore how a Sales Order flows through Delivery → Billing → Journal Entry → Payment, and ask natural-language questions that are answered with live SQL queries against the underlying SQLite database.
+
+---
+
+## Tech Stack
+
+| Layer | Technology | Purpose |
+|---|---|---|
+| **Frontend** | React 18 + Vite + TypeScript | SPA dashboard |
+| **Graph Visualisation** | react-force-graph-2d | Force-directed canvas rendering |
+| **Backend** | FastAPI (Python) | REST API + lifespan graph cache |
+| **Graph Engine** | NetworkX `DiGraph` | In-memory transactional graph |
+| **Database** | SQLite | Zero-setup, portable, S/4HANA schema |
+| **AI / NL-to-SQL** | Groq — `llama-3.3-70b-versatile` | SQL generation (accuracy) |
+| **AI / Summaries** | Groq — `llama-3.1-8b-instant` | Natural language answers (speed) |
+| **Deployment** | Railway (backend) + Vercel (frontend) | Serverless + PaaS |
+
+---
+
+## Architecture
+
+### Database Schema — strict S/4HANA mapping
+
+The SQLite database mirrors SAP S/4HANA entity types exactly. Every table name and every column maps directly to the corresponding OData entity or field:
+
+```
+MASTER DATA
+  business_partners          ← BusinessPartner (BuPa)
+  business_partner_addresses ← BusinessPartnerAddress
+  products                   ← Product
+  product_descriptions       ← ProductDescription (language-filtered)
+  plants                     ← Plant
+
+ORDER MANAGEMENT
+  sales_order_headers        ← SalesOrder (header)
+  sales_order_items          ← SalesOrderItem
+
+LOGISTICS
+  outbound_delivery_headers  ← OutboundDeliveryHeader
+  outbound_delivery_items    ← OutboundDeliveryItem
+
+BILLING & FINANCE
+  billing_document_headers   ← BillingDocument (header)
+  billing_document_items     ← BillingDocumentItem
+  billing_document_cancellations  ← S1 reversal link
+  journal_entry_items_accounts_receivable  ← JournalEntryItem (AR)
+  payments_accounts_receivable             ← PaymentAccountsReceivable
+```
+
+### Graph Model — transactional edges
+
+The NetworkX `DiGraph` is built once at server startup and cached in memory. Nodes represent business entities; directed edges represent the O2C process flow:
+
+```
+SalesOrder   ──[HAS_ITEM]────────►  Product
+SalesOrder   ──[DELIVERED_IN]────►  Delivery
+Delivery     ──[BILLED_IN]───────►  BillingDocument
+BillingDocument ──[POSTED_TO]───►  JournalEntry
+JournalEntry ──[PAID_BY]────────►  Payment
+BillingDocument ──[CANCELLED_BY]►  BillingDocument  (S1 reversal)
+```
+
+### AI Chat — two-model pipeline
+
+```
+User query
+    │
+    ▼
+llama-3.3-70b-versatile  ←── SYSTEM_PROMPT (full schema + 5-step O2C join chain)
+    │  JSON mode enforces {"type":"sql_query","sql":"...","explanation":"..."}
+    ▼
+SQLite executor  (SELECT-only guard)
+    │
+    ▼
+llama-3.1-8b-instant  ←── results[:20] → concise natural-language answer
+    │
+    ▼
+Response + highlighted graph node IDs
+```
+
+---
+
+## Running Locally
+
+### Prerequisites
+
+- Python 3.9+
+- Node.js 18+
+- A free [Groq API key](https://console.groq.com) (no credit card required)
 
 ### Backend
 
 ```bash
 cd backend
+
+# Install dependencies
 pip install -r requirements.txt
-cp .env.example .env        # paste your Gemini API key
-python ingest.py             # one-time data ingestion (~30 seconds)
+
+# Configure environment
+cp .env.example .env
+# → paste your GROQ_API_KEY into .env
+
+# Ingest the SAP dataset (creates backend/data/o2c.db)
+python ingest.py
+
+# Start the API server
 uvicorn main:app --reload --port 8000
+```
+
+The API will be available at `http://localhost:8000`. Verify with:
+
+```bash
+curl http://localhost:8000/health
 ```
 
 ### Frontend
 
 ```bash
 cd frontend
+
 npm install
 npm run dev
 ```
 
-Open [http://localhost:5173](http://localhost:5173)
+Open [http://localhost:5173](http://localhost:5173).
 
-## Gemini API Key
-
-Get a free key at: <https://aistudio.google.com/app/apikey>  
-No credit card required. 15 requests/minute free.
-
----
-
-## Architecture
-
-### Why SQLite over Neo4j?
-
-SQLite is zero-setup, portable, and the dataset is small enough (~50 K rows). Complex graph traversals are handled in Python with NetworkX after loading from SQLite. This avoids Cypher query complexity while keeping the analytical power of graph algorithms.
-
-### Why NetworkX for graph construction?
-
-The graph is built once at server startup and cached in memory. NetworkX enables rich algorithms (centrality, path finding, connected components) that would require complex Cypher in Neo4j. For a dataset of this scale, in-memory is fast enough.
-
-### Why Gemini Flash for LLM?
-
-Free tier with 15 RPM and 1 M TPM is sufficient for demo purposes. The structured JSON response format (`type` + `sql`/`message`) makes it robust against hallucination — if Gemini doesn't return valid JSON, the system catches it and returns an error rather than a fabricated answer.
-
-### Guardrails strategy
-
-Two layers:
-
-1. **LLM-level** — System prompt explicitly instructs the model to return `{"type": "off_topic"}` for non-dataset queries.
-2. **Code-level** — SQL executor only allows `SELECT` statements; any mutation attempt throws a `ValueError`.
-
----
-
-## Graph Model
-
-### Node types
-
-| Node Type | Color | Key field |
-|-----------|-------|-----------|
-| Customer | `#FF6B6B` coral red | businessPartner |
-| SalesOrder | `#4ECDC4` teal | salesOrder |
-| Delivery | `#45B7D1` sky blue | deliveryDocument |
-| BillingDocument | `#96CEB4` sage green | billingDocument |
-| JournalEntry | `#FFEAA7` pale yellow | accountingDocument |
-| Payment | `#DDA0DD` plum | accountingDocument + item |
-| Product | `#98D8C8` mint | product |
-| Plant | `#F7DC6F` golden | plant |
-
-### Edge relationships
-
-```
-Customer        ──PLACED──►       SalesOrder
-SalesOrder      ──HAS_DELIVERY──► DeliveryHeader
-SalesOrder      ──CONTAINS──►     Product
-DeliveryHeader  ──BILLED_IN──►    BillingDocument
-BillingDocument ──GENERATES──►    JournalEntry
-JournalEntry    ──CLEARED_BY──►   Payment
-DeliveryHeader  ──SHIPPED_FROM──► Plant
-BillingDocument ──CANCELLED_BY──► BillingDocument  (S1 type)
-```
-
-### O2C logic fixes implemented
-
-- **Delivery → Billing join**: `billing_items.reference_sd_document = delivery_headers.delivery_document`
-- **S1 cancellation edges**: billing docs with `billing_document_type = 'S1'` generate `CANCELLED_BY` edges back to their original billing doc via `billing_items.reference_sd_document`
-
----
-
-## Example Queries
-
-1. `Which products are associated with the highest number of billing documents?`
-2. `Trace the full flow of billing document 91150187`
-3. `Which sales orders were delivered but never billed?`
-4. `Show me the top 5 customers by total revenue`
-5. `How many payments have been cleared in April 2025?`
-6. `Which plants handle the most deliveries?`
-7. `Find all billing documents that were cancelled`
+> The Vite dev server proxies `/api/*` → `http://localhost:8000` so no CORS issues locally.
 
 ---
 
@@ -116,14 +140,79 @@ BillingDocument ──CANCELLED_BY──► BillingDocument  (S1 type)
 
 ### Backend → Railway
 
-1. Add `backend/Procfile`:
+1. Push this repository to GitHub.
+2. Create a new Railway project and point it at the `backend/` directory.
+3. Set the environment variable `GROQ_API_KEY` in Railway's Variables panel.
+4. Railway auto-detects `Procfile` and runs:
    ```
-   web: uvicorn main:app --host 0.0.0.0 --port $PORT
+   uvicorn main:app --host 0.0.0.0 --port $PORT
    ```
-2. Set `GEMINI_API_KEY` as a Railway environment variable.
-3. Add a startup script that runs `python ingest.py` if `data/o2c.db` doesn't exist yet.
+5. Note the Railway public URL (e.g. `https://o2c-nexus.up.railway.app`).
 
 ### Frontend → Vercel
 
-1. Update `frontend/.env.production` with your Railway URL.
-2. Push `frontend/` to Vercel — `vercel.json` handles SPA routing automatically.
+1. Import the repository into Vercel and set the **Root Directory** to `frontend/`.
+2. Add an environment variable:
+   ```
+   VITE_API_URL = https://o2c-nexus.up.railway.app/api
+   ```
+3. Deploy — `vercel.json` handles SPA routing automatically.
+
+---
+
+## Example Queries
+
+Try these in the AI chat panel:
+
+| Query | What it demonstrates |
+|---|---|
+| `Which customers have the highest total billed amount?` | Cross-table JOIN across 4 entities |
+| `Trace the full O2C flow for sales order 740506` | 5-step chain traversal |
+| `Which billing documents were cancelled and why?` | S1 cancellation analysis |
+| `Show deliveries with pending goods movement status` | Logistics status filtering |
+| `Which products appear in the most sales orders?` | Aggregation + ranking |
+| `What is the total revenue billed in April 2025?` | Date-range financial query |
+
+---
+
+## Project Structure
+
+```
+O2C Nexus/
+├── backend/
+│   ├── main.py              # FastAPI app + lifespan graph cache
+│   ├── ingest.py            # Production JSONL → SQLite pipeline
+│   ├── database.py          # Schema DDL + reset_schema()
+│   ├── graph_builder.py     # NetworkX DiGraph construction
+│   ├── query_engine.py      # Groq NL-to-SQL engine
+│   ├── requirements.txt
+│   ├── Procfile             # Railway start command
+│   └── railway.json         # Railway deployment config
+├── frontend/
+│   ├── src/
+│   │   ├── App.tsx           # Layout + state management
+│   │   ├── api.ts            # Typed fetch client (VITE_API_URL)
+│   │   └── components/
+│   │       ├── GraphCanvas.tsx    # ForceGraph2D + hover tooltip
+│   │       ├── ChatPanel.tsx      # AI chat interface
+│   │       └── NodeDetailPanel.tsx # Click-to-pin detail card
+│   ├── vite.config.ts
+│   └── vercel.json
+└── dataset/
+    └── sap-o2c-data/        # Real SAP S/4HANA JSONL export
+        ├── sales_order_headers/
+        ├── billing_document_headers/
+        └── ...
+```
+
+---
+
+## Data Source
+
+The dataset is a real SAP S/4HANA sandbox export covering ~1,400 transactional records across 14 entity types in the Order-to-Cash process. All business identifiers are from a non-production sandbox environment.
+
+---
+
+## License
+
+MIT

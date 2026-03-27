@@ -1,90 +1,131 @@
 import os
 import json
-import warnings
-
-# Suppress the deprecation warning — google-generativeai still works correctly
-warnings.filterwarnings("ignore", category=FutureWarning, module="google.generativeai")
-
-import google.generativeai as genai
+from typing import Dict, List, Optional
+from groq import Groq
 from dotenv import load_dotenv
 
 load_dotenv()
 
-MODEL_NAME = "gemini-2.0-flash"
+# Module-level client — instantiated once at startup
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-_api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-if _api_key:
-    genai.configure(api_key=_api_key)
+# Updated to the new active Groq models
+# llama-3.3-70b-versatile → SQL generation (accuracy critical)
+SQL_MODEL = "llama-3.3-70b-versatile"
 
+# llama-3.1-8b-instant    → Natural language summaries (speed/cost optimised)
+NL_MODEL = "llama-3.1-8b-instant"
 
-def _get_model() -> genai.GenerativeModel:
-    if not _api_key:
-        raise ValueError("GOOGLE_API_KEY not found in environment.")
-    return genai.GenerativeModel(MODEL_NAME)
+SYSTEM_PROMPT = """You are a data analyst for an SAP S/4HANA Order-to-Cash (O2C) business process.
+You have access to a SQLite database with the following tables and columns:
 
+MASTER DATA
+  business_partners(businessPartnerId, partnerType, fullName)
+  business_partner_addresses(addressId, businessPartnerId, city, country, postalCode, streetName)
+  products(productId, productType, grossWeight, weightUnit)
+  product_descriptions(productId, language, productName)
+  plants(plantId, plantName, salesOrganization)
 
-SYSTEM_PROMPT = """You are a data analyst for an SAP Order-to-Cash (O2C) business process.
-You have access to a SQLite database with these tables:
+ORDER MANAGEMENT
+  sales_order_headers(salesOrderId, customerId, salesOrganization, distributionChannel, division, creationDate, overallStatus, totalNetAmount, currency)
+  sales_order_items(salesOrderId, itemPosition, productId, orderQuantity, netAmount)
 
-customers(business_partner, full_name, city, country)
-sales_order_headers(sales_order, sold_to_party, creation_date, total_net_amount, overall_delivery_status, transaction_currency)
-sales_order_items(sales_order, sales_order_item, material, requested_quantity, net_amount)
-delivery_headers(delivery_document, creation_date, shipping_point, overall_goods_movement_status)
-delivery_items(delivery_document, delivery_document_item, reference_sd_document, reference_sd_document_item, plant, storage_location)
-billing_headers(billing_document, billing_document_type, creation_date, billing_document_date, total_net_amount, sold_to_party, transaction_currency, billing_document_is_cancelled)
-billing_items(billing_document, billing_document_item, material, billing_quantity, net_amount, reference_sd_document, reference_sd_document_item)
-journal_entries(accounting_document, accounting_document_item, reference_document, gl_account, amount_in_transaction_currency, transaction_currency, posting_date, profit_center)
-payments(accounting_document, accounting_document_item, customer, clearing_date, clearing_accounting_document, amount_in_transaction_currency, transaction_currency, invoice_reference)
-products(product, product_type, gross_weight, weight_unit, product_description)
-plants(plant, plant_name, sales_organization)
+LOGISTICS
+  outbound_delivery_headers(deliveryId, shippingPoint, deliveryDate, goodsMovementStatus)
+  outbound_delivery_items(deliveryId, itemPosition, referenceSalesOrderId, referenceSalesOrderItem, deliveredQuantity, plant)
 
-KEY RELATIONSHIPS:
-- sales_order_headers.sold_to_party -> customers.business_partner
-- sales_order_items.sales_order -> sales_order_headers.sales_order
-- sales_order_items.material -> products.product
-- delivery_items.reference_sd_document -> sales_order_headers.sales_order (delivery links to SO)
-- delivery_items.delivery_document -> delivery_headers.delivery_document
-- delivery_items.plant -> plants.plant
-- billing_items.reference_sd_document -> delivery_headers.delivery_document (billing links to delivery)
-- billing_items.billing_document -> billing_headers.billing_document
-- journal_entries.reference_document -> billing_headers.billing_document
-- payments.accounting_document -> journal_entries.accounting_document
+BILLING & FINANCE
+  billing_document_headers(billingDocumentId, billingDate, billingType, customerId, totalNetAmount, currency, isCancelled)
+  billing_document_items(billingDocumentId, itemPosition, referenceDeliveryId, referenceDeliveryItem, billedAmount, productId)
+  billing_document_cancellations(cancelledBillingDocumentId, cancellationBillingDocumentId, cancellationDate)
+  journal_entry_items_accounts_receivable(journalEntryId, referenceBillingDocumentId, amount, currency, postingDate, glAccount, profitCenter)
+  payments_accounts_receivable(paymentId, referenceJournalEntryId, paymentAmount, currency, paymentDate, customerId)
 
-GUARDRAILS — IMPORTANT:
-- You ONLY answer questions about this O2C dataset and SAP business processes.
-- If the user asks about anything unrelated (general knowledge, coding, personal questions,
-  creative writing, current events, etc.), respond ONLY with:
-  {"type": "off_topic", "message": "This system is designed to answer questions about the Order-to-Cash dataset only. Please ask about sales orders, deliveries, billing, payments, customers, or products."}
-- Never make up data. Always query the database.
-- For tracing flows, use JOINs across all relevant tables.
+KEY O2C JOINS & RELATIONSHIPS:
 
-RESPONSE FORMAT — always respond with valid JSON only, no markdown fences:
+  Step 1 — SO to Customer:
+    sales_order_headers.customerId = business_partners.businessPartnerId
+
+  Step 2 — SO to Delivery:
+    outbound_delivery_items.referenceSalesOrderId = sales_order_headers.salesOrderId
+    (outbound_delivery_items.deliveryId links items to outbound_delivery_headers.deliveryId)
+
+  Step 3 — Delivery to Billing:
+    billing_document_items.referenceDeliveryId = outbound_delivery_headers.deliveryId
+    (billing_document_items.billingDocumentId links items to billing_document_headers.billingDocumentId)
+
+  Step 4 — Billing to Journal Entry:
+    journal_entry_items_accounts_receivable.referenceBillingDocumentId = billing_document_headers.billingDocumentId
+
+  Step 5 — Journal Entry to Payment:
+    payments_accounts_receivable.referenceJournalEntryId = journal_entry_items_accounts_receivable.journalEntryId
+
+  Cancellations:
+    billing_document_cancellations.cancelledBillingDocumentId = billing_document_headers.billingDocumentId
+    (cancellationBillingDocumentId is the S1 reversal document)
+
+SUPPLEMENTARY JOINS:
+  - business_partner_addresses.businessPartnerId = business_partners.businessPartnerId
+  - sales_order_items.salesOrderId = sales_order_headers.salesOrderId
+  - sales_order_items.productId = products.productId
+  - product_descriptions.productId = products.productId  (use language = 'EN' for names)
+  - outbound_delivery_items.plant = plants.plantId
+
+BUSINESS LOGIC & DEFINITIONS:
+- "Sales" or "Most Sales": Calculate this by summing `netAmount` from `sales_order_items` grouped by `productId`, or by counting `salesOrderId`. DO NOT over-join to billing or delivery tables unless explicitly requested.
+- "Revenue": Calculate this by summing `billedAmount` in `billing_document_items`.
+- "Customers": Always refers to `businessPartnerId` in the `business_partners` table.
+- GOLDEN RULE FOR SQL: Keep queries as simple as possible. Only JOIN the tables that are strictly required to answer the user's question. Avoid massive 5-table joins if a 2-table join gives the answer.
+
+GUARDRAILS:
+1. You must restrict all answers exclusively to the SAP O2C dataset and domain.
+2. If the user asks a general knowledge question, requests creative writing, or asks about completely irrelevant topics, you MUST reject it.
+3. To reject the prompt, you must output ONLY this JSON format, using this exact phrasing:
+   {"type": "off_topic", "message": "This system is designed to answer questions related to the provided dataset only."}
+
+ADDITIONAL RULES:
+- Never fabricate data. Every answer must be backed by a SQL query against the database.
+- For full O2C flow traces, chain JOINs through all 5 steps above.
+- billingType = 'S1' means a cancellation/reversal document.
+- isCancelled = 1 means the billing document has been cancelled.
+
+RESPONSE FORMAT — respond with valid JSON only, no markdown fences:
 For data queries:   {"type": "sql_query", "sql": "SELECT ...", "explanation": "brief what this does"}
-For off-topic:      {"type": "off_topic", "message": "..."}
+For off-topic:      {"type": "off_topic", "message": "This system is designed to answer questions related to the provided dataset only."}
 For clarification:  {"type": "clarification", "message": "..."}
 """
 
+def classify_and_generate_sql(
+    user_query: str,
+    chat_history: Optional[List[Dict[str, str]]] = None,
+) -> dict:
+    """
+    Use the larger model for accurate SQL generation.
+    chat_history is injected between the system prompt and the current user
+    message so the model can resolve pronouns and references from prior turns.
+    JSON mode enforces valid output.
+    """
+    # Cap history at 20 messages (10 turns) to stay well within token limits
+    history = (chat_history or [])[-20:]
 
-def classify_and_generate_sql(user_query: str) -> dict:
-    model = _get_model()
-    prompt = f"{SYSTEM_PROMPT}\n\nUser query: {user_query}"
-    response = model.generate_content(prompt)
-    text = response.text.strip()
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        *history,
+        {"role": "user", "content": user_query},
+    ]
 
-    # Strip accidental markdown code fences
-    if "```" in text:
-        parts = text.split("```")
-        for part in parts:
-            if "{" in part and "}" in part:
-                text = part.strip()
-                if text.startswith("json"):
-                    text = text[4:].strip()
-                break
-
+    response = client.chat.completions.create(
+        model=SQL_MODEL,
+        messages=messages,
+        response_format={"type": "json_object"},
+        temperature=0.1,
+    )
+    text = response.choices[0].message.content.strip()
     return json.loads(text)
 
 
 def execute_sql(sql: str, db_conn) -> list:
+    """Execute a SELECT-only query and return rows as dicts. Max 100 rows."""
     sql_upper = sql.strip().upper()
     forbidden = ["INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER", "TRUNCATE"]
     if any(k in sql_upper for k in forbidden):
@@ -100,20 +141,32 @@ def execute_sql(sql: str, db_conn) -> list:
 
 
 def format_answer(user_query: str, sql: str, results: list) -> str:
-    model = _get_model()
-    prompt = (
-        f'Given this query "{user_query}", this SQL "{sql}", '
-        f"and these results: {json.dumps(results[:20])}, "
-        f"write a clear, concise natural language answer. "
-        f"Be specific with numbers. Max 3 sentences."
+    """Use the smaller, faster model for natural language summaries."""
+    response = client.chat.completions.create(
+        model=NL_MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": (
+                    f'Given this query "{user_query}", this SQL "{sql}", '
+                    f"and these results: {json.dumps(results[:20])}, "
+                    f"write a clear, concise natural language answer. "
+                    f"Be specific with numbers. Max 3 sentences."
+                ),
+            }
+        ],
+        temperature=0.3,
     )
-    response = model.generate_content(prompt)
-    return response.text.strip()
+    return response.choices[0].message.content.strip()
 
 
-def answer_query(user_query: str, db_conn) -> dict:
+def answer_query(
+    user_query: str,
+    db_conn,
+    chat_history: Optional[List[Dict[str, str]]] = None,
+) -> dict:
     try:
-        classification = classify_and_generate_sql(user_query)
+        classification = classify_and_generate_sql(user_query, chat_history)
     except Exception as e:
         print(f"Engine Error (classify): {e}")
         return {
@@ -149,15 +202,18 @@ def answer_query(user_query: str, db_conn) -> dict:
         except Exception:
             answer = f"Query returned {len(results)} results."
 
+        # Map result column names to graph node ID prefixes
         node_ids = []
         for row in results:
             mappings = {
-                "sales_order": "so_",
-                "delivery_document": "del_",
-                "billing_document": "bill_",
-                "accounting_document": "journal_",
-                "business_partner": "customer_",
-                "product": "product_",
+                "salesOrderId":          "so_",
+                "deliveryId":            "del_",
+                "billingDocumentId":     "bill_",
+                "journalEntryId":        "je_",
+                "paymentId":             "pay_",
+                "businessPartnerId":     "customer_",
+                "productId":             "prod_",
+                "plantId":               "plant_",
             }
             for key, prefix in mappings.items():
                 val = row.get(key)

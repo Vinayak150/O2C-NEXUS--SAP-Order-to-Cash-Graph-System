@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import { sendChat } from "../api";
+import type { ChatHistoryItem } from "../api";
 
 interface Message {
   role: "user" | "assistant";
@@ -64,10 +65,19 @@ export default function ChatPanel({ onHighlightNodes }: ChatPanelProps) {
     const text = (query ?? input).trim();
     if (!text || loading) return;
     setInput("");
+
+    // Snapshot history *before* appending the new user message.
+    // Only include clean user/assistant turns — skip any error-state bubbles
+    // (identifiable by the generic error string we set in the catch block).
+    const ERROR_CONTENT = "An error occurred. Please try again.";
+    const chatHistory: ChatHistoryItem[] = messages
+      .filter((m) => m.content !== ERROR_CONTENT)
+      .map(({ role, content }) => ({ role, content }));
+
     setMessages((prev) => [...prev, { role: "user", content: text }]);
     setLoading(true);
     try {
-      const res = await sendChat(text);
+      const res = await sendChat(text, chatHistory);
       setMessages((prev) => [
         ...prev,
         {
@@ -83,7 +93,7 @@ export default function ChatPanel({ onHighlightNodes }: ChatPanelProps) {
     } catch {
       setMessages((prev) => [
         ...prev,
-        { role: "assistant", content: "An error occurred. Please try again." },
+        { role: "assistant", content: ERROR_CONTENT },
       ]);
     } finally {
       setLoading(false);

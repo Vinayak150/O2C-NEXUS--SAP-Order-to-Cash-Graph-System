@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import GraphCanvas from "./components/GraphCanvas";
 import ChatPanel from "./components/ChatPanel";
 import NodeDetailPanel from "./components/NodeDetailPanel";
@@ -60,7 +60,10 @@ export default function App() {
   const [highlightedNodes, setHighlightedNodes] = useState<Set<string>>(
     new Set()
   );
+  // Click-to-pin state — persists until the user closes the panel
   const [selectedNode, setSelectedNode] = useState<any | null>(null);
+  const [selectedPos, setSelectedPos] = useState({ x: 0, y: 0 });
+
   const [stats, setStats] = useState<StatsData | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -73,6 +76,32 @@ export default function App() {
       .catch(console.error)
       .finally(() => setLoading(false));
   }, []);
+
+  // Degree count for NodeDetailPanel "Connections" footer
+  const getDegree = useCallback(
+    (nodeId: string): number => {
+      if (!graphData) return 0;
+      return graphData.links.filter((l: any) => {
+        const src = typeof l.source === "object" ? l.source?.id : l.source;
+        const tgt = typeof l.target === "object" ? l.target?.id : l.target;
+        return src === nodeId || tgt === nodeId;
+      }).length;
+    },
+    [graphData]
+  );
+
+  // GraphCanvas forwards mousePos alongside the node on every click
+  const handleNodeClick = useCallback(
+    (node: any, screenX: number, screenY: number) => {
+      if (selectedNode?.id === node.id) {
+        setSelectedNode(null); // second click on same node unpins
+      } else {
+        setSelectedNode(node);
+        setSelectedPos({ x: screenX, y: screenY });
+      }
+    },
+    [selectedNode]
+  );
 
   const handleHighlightNodes = (ids: string[]) => {
     setHighlightedNodes(new Set(ids));
@@ -107,7 +136,6 @@ export default function App() {
           flexShrink: 0,
         }}
       >
-        {/* Left: icon + title */}
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <span style={{ fontSize: 20, lineHeight: 1 }}>⬡</span>
           <span
@@ -122,7 +150,6 @@ export default function App() {
           </span>
         </div>
 
-        {/* Center: stats chips */}
         <div
           style={{
             flex: 1,
@@ -135,21 +162,14 @@ export default function App() {
           {stats && (
             <>
               <StatChip label="Customers" value={stats.total_customers} />
-              <StatChip
-                label="Sales Orders"
-                value={stats.total_sales_orders}
-              />
-              <StatChip
-                label="Billing Docs"
-                value={stats.total_billing_docs}
-              />
+              <StatChip label="Sales Orders" value={stats.total_sales_orders} />
+              <StatChip label="Billing Docs" value={stats.total_billing_docs} />
               <StatChip label="Payments" value={stats.total_payments} />
               <StatChip label="Products" value={stats.total_products} />
             </>
           )}
         </div>
 
-        {/* Right: Gemini badge */}
         <div
           style={{
             display: "flex",
@@ -165,47 +185,39 @@ export default function App() {
           }}
         >
           
-          <span>Powered by Vinayak</span>
+          <span>Created by Vinayak</span>
         </div>
       </div>
 
-      {/* Main content area — fills remaining height */}
-      <div
-        style={{
-          flex: 1,
-          display: "flex",
-          overflow: "hidden",
-        }}
-      >
+      {/* Main content area */}
+      <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
         {/* Graph area */}
-        <div
-          style={{
-            flex: 1,
-            position: "relative",
-            overflow: "hidden",
-          }}
-        >
+        <div style={{ flex: 1, position: "relative", overflow: "hidden" }}>
           {loading || !graphData ? (
             <Spinner />
           ) : (
             <GraphCanvas
               graphData={graphData}
               highlightedNodes={highlightedNodes}
-              onNodeClick={(node) => setSelectedNode(node)}
+              onNodeClick={handleNodeClick}
               onClearHighlight={handleClearHighlight}
             />
           )}
 
-          {/* Node detail popup — absolute bottom-left of graph area */}
+          {/* NodeDetailPanel — click-to-pin only, always pinned=true */}
           {selectedNode && (
             <NodeDetailPanel
               node={selectedNode}
+              connections={getDegree(selectedNode.id)}
+              screenX={selectedPos.x}
+              screenY={selectedPos.y}
+              pinned={true}
               onClose={() => setSelectedNode(null)}
             />
           )}
         </div>
 
-        {/* Chat panel — right side */}
+        {/* Chat panel */}
         <ChatPanel onHighlightNodes={handleHighlightNodes} />
       </div>
 

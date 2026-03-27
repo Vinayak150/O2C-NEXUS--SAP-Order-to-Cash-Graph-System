@@ -4,7 +4,8 @@ import ForceGraph2D from "react-force-graph-2d";
 interface GraphCanvasProps {
   graphData: { nodes: any[]; links: any[] };
   highlightedNodes: Set<string>;
-  onNodeClick: (node: any) => void;
+  /** Receives node + the current mouse viewport coords for NodeDetailPanel positioning */
+  onNodeClick: (node: any, screenX: number, screenY: number) => void;
   onClearHighlight: () => void;
 }
 
@@ -24,6 +25,15 @@ const LEGEND_ENTRIES = Object.entries(NODE_COLORS).filter(
   ([k]) => k !== "default"
 );
 
+/**
+ * Keys injected by the ForceGraph2D physics engine — never meaningful to the
+ * user, and must be excluded from the tooltip data table.
+ */
+const TOOLTIP_IGNORED_KEYS = new Set([
+  "id", "x", "y", "vx", "vy", "fx", "fy",
+  "index", "color", "val", "type", "label", "group",
+]);
+
 export default function GraphCanvas({
   graphData,
   highlightedNodes,
@@ -34,6 +44,11 @@ export default function GraphCanvas({
   const containerRef = useRef<HTMLDivElement>(null);
   const [dimensions, setDimensions] = useState({ width: 800, height: 600 });
 
+  // ── Hover tooltip state ──────────────────────────────────────────────────
+  const [hoverNode, setHoverNode] = useState<any>(null);
+  const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
+
+  // ── Container resize observer ────────────────────────────────────────────
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
@@ -47,7 +62,7 @@ export default function GraphCanvas({
     return () => observer.disconnect();
   }, []);
 
-  // PROMPT 12 — zoom/pan to first highlighted node
+  // ── Zoom/pan to first highlighted node (chat response) ───────────────────
   useEffect(() => {
     if (highlightedNodes.size === 0 || !forceRef.current) return;
     const firstId = Array.from(highlightedNodes)[0];
@@ -60,6 +75,7 @@ export default function GraphCanvas({
     }
   }, [highlightedNodes, graphData.nodes]);
 
+  // ── Canvas node painter ──────────────────────────────────────────────────
   const getColor = useCallback(
     (node: any): string =>
       NODE_COLORS[node.type as string] ?? NODE_COLORS.default,
@@ -68,15 +84,19 @@ export default function GraphCanvas({
 
   const getRadius = useCallback(
     (node: any): number => {
-      if (highlightedNodes.has(node.id)) return 8;
-      const degree = graphData.links.filter((l: any) => {
-        const src = typeof l.source === "object" ? l.source?.id : l.source;
-        const tgt = typeof l.target === "object" ? l.target?.id : l.target;
-        return src === node.id || tgt === node.id;
-      }).length;
-      return degree > 5 ? 6 : 4;
+      // Use the server-computed degree-centrality size when available.
+      // calculated_val = 2.0 + (degree * 0.5), injected by graph_builder.py.
+      // Clamp between 2 and 12 so no node becomes unreadably large.
+      const base: number =
+        typeof node.calculated_val === "number"
+          ? Math.min(Math.max(node.calculated_val, 2), 12)
+          : 4; // fallback for stale payloads without the attribute
+
+      // Highlighted nodes get a visible boost on top of their natural size.
+      if (highlightedNodes.has(node.id)) return Math.max(base + 2, 8);
+      return base;
     },
-    [highlightedNodes, graphData.links]
+    [highlightedNodes]
   );
 
   const paintNode = useCallback(
@@ -100,7 +120,7 @@ export default function GraphCanvas({
     [getColor, getRadius, highlightedNodes]
   );
 
-  // PROMPT 12 — Reset View button
+  // ── Reset View ───────────────────────────────────────────────────────────
   const handleResetView = useCallback(() => {
     onClearHighlight();
     if (forceRef.current) {
@@ -108,9 +128,17 @@ export default function GraphCanvas({
     }
   }, [onClearHighlight]);
 
+  // ── Tooltip data rows (filter out physics / meta keys) ───────────────────
+  const tooltipEntries = hoverNode
+    ? Object.entries(hoverNode).filter(([key]) => !TOOLTIP_IGNORED_KEYS.has(key))
+    : [];
+
   return (
     <div
       ref={containerRef}
+      onMouseMove={(e) => {
+        setMousePos({ x: e.clientX, y: e.clientY });
+      }}
       style={{
         position: "relative",
         flex: 1,
@@ -132,11 +160,88 @@ export default function GraphCanvas({
         cooldownTicks={100}
         nodeCanvasObject={paintNode}
         nodeCanvasObjectMode={() => "replace"}
-        onNodeClick={onNodeClick}
-        nodeLabel={(node: any) => node.label ?? node.id}
+        onNodeClick={(node) => onNodeClick(node, mousePos.x, mousePos.y)}
+        onNodeHover={(node) => setHoverNode(node)}
       />
 
-      {/* Legend — absolute top-left */}
+      {/* ── Floating hover tooltip ─────────────────────────────────────── */}
+      {hoverNode && (
+        <div
+          style={{
+            position: "fixed",
+            left: mousePos.x + 15,
+            top: mousePos.y + 15,
+            zIndex: 1000,
+            backgroundColor: "rgba(30, 41, 59, 0.95)",
+            color: "white",
+            padding: "12px",
+            borderRadius: "8px",
+            boxShadow: "0 4px 6px rgba(0,0,0,0.3)",
+            pointerEvents: "none",
+            fontSize: "12px",
+            maxHeight: "400px",
+            overflowY: "auto",
+            minWidth: "200px",
+            maxWidth: "320px",
+          }}
+        >
+          {/* Header */}
+          <h3
+            style={{
+              margin: "0 0 8px 0",
+              fontSize: "13px",
+              fontWeight: 700,
+              color: NODE_COLORS[hoverNode.type as string] ?? "#fff",
+              borderBottom: "1px solid rgba(255,255,255,0.12)",
+              paddingBottom: "6px",
+              wordBreak: "break-all",
+            }}
+          >
+            {hoverNode.label ?? hoverNode.id}
+          </h3>
+
+          {/* Entity type badge */}
+          <div style={{ marginBottom: "8px" }}>
+            <span
+              style={{
+                display: "inline-block",
+                background: "rgba(255,255,255,0.1)",
+                borderRadius: "4px",
+                padding: "1px 7px",
+                fontSize: "10px",
+                letterSpacing: "0.06em",
+                fontWeight: 600,
+                textTransform: "uppercase",
+              }}
+            >
+              {hoverNode.type}
+            </span>
+          </div>
+
+          {/* Data rows */}
+          {tooltipEntries.map(([key, value]) => (
+            <div
+              key={key}
+              style={{
+                marginBottom: "3px",
+                lineHeight: 1.55,
+                display: "flex",
+                gap: "6px",
+                flexWrap: "wrap",
+              }}
+            >
+              <strong style={{ color: "#94a3b8", flexShrink: 0 }}>
+                {key}:
+              </strong>
+              <span style={{ color: "#e2e8f0", wordBreak: "break-all" }}>
+                {String(value ?? "—")}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* ── Legend — top-left ─────────────────────────────────────────────── */}
       <div
         style={{
           position: "absolute",
@@ -167,16 +272,14 @@ export default function GraphCanvas({
                 flexShrink: 0,
               }}
             />
-            <span
-              style={{ fontSize: 11, color: "#ccc", whiteSpace: "nowrap" }}
-            >
+            <span style={{ fontSize: 11, color: "#ccc", whiteSpace: "nowrap" }}>
               {type}
             </span>
           </div>
         ))}
       </div>
 
-      {/* Reset View — absolute top-right */}
+      {/* ── Reset View — top-right ────────────────────────────────────────── */}
       <button
         onClick={handleResetView}
         style={{

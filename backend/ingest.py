@@ -1,338 +1,279 @@
+"""
+Production data pipeline for the SAP S/4HANA O2C dataset.
+
+Layout on disk:
+    dataset/sap-o2c-data/
+        <table_name>/          ← subdirectory whose name == target table
+            part-*.jsonl       ← one or more JSONL shards
+
+Run from the backend/ directory:
+    python ingest.py
+"""
+
 import os
 import json
+import sqlite3
+from typing import Dict, List, Optional, Tuple
 
-from database import get_db, init_db
+from database import reset_schema, DB_PATH
 
-# Updated path to correctly locate the dataset folder relative to the backend directory
-DATASET_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../dataset/sap-o2c-data")
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+# dataset/sap-o2c-data/ lives one level above backend/ inside the project root
+DATA_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "dataset", "sap-o2c-data"
+)
+
+CHUNK_SIZE = 1000  # rows per executemany() batch
+
+# ---------------------------------------------------------------------------
+# Column mapping
+#   Each entry:  (db_column_name, jsonl_field_name)
+#   jsonl_field_name = None  →  value is computed in _extract_row()
+# ---------------------------------------------------------------------------
+
+TABLE_COLUMN_MAPS: Dict[str, List[Tuple[str, Optional[str]]]] = {
+    "business_partners": [
+        ("businessPartnerId", "businessPartner"),
+        ("partnerType",       "businessPartnerGrouping"),
+        ("fullName",          "businessPartnerFullName"),
+    ],
+    "business_partner_addresses": [
+        ("addressId",         "addressId"),
+        ("businessPartnerId", "businessPartner"),
+        ("city",              "cityName"),
+        ("country",           "country"),
+        ("postalCode",        "postalCode"),
+        ("streetName",        "streetName"),
+    ],
+    "sales_order_headers": [
+        ("salesOrderId",        "salesOrder"),
+        ("customerId",          "soldToParty"),
+        ("salesOrganization",   "salesOrganization"),
+        ("distributionChannel", "distributionChannel"),
+        ("division",            "organizationDivision"),
+        ("creationDate",        "creationDate"),
+        ("overallStatus",       "overallDeliveryStatus"),
+        ("totalNetAmount",      "totalNetAmount"),
+        ("currency",            "transactionCurrency"),
+    ],
+    "sales_order_items": [
+        ("salesOrderId",  "salesOrder"),
+        ("itemPosition",  "salesOrderItem"),
+        ("productId",     "material"),
+        ("orderQuantity", "requestedQuantity"),
+        ("netAmount",     "netAmount"),
+    ],
+    "outbound_delivery_headers": [
+        ("deliveryId",          "deliveryDocument"),
+        ("shippingPoint",       "shippingPoint"),
+        ("deliveryDate",        "creationDate"),
+        ("goodsMovementStatus", "overallGoodsMovementStatus"),
+    ],
+    "outbound_delivery_items": [
+        ("deliveryId",              "deliveryDocument"),
+        ("itemPosition",            "deliveryDocumentItem"),
+        ("referenceSalesOrderId",   "referenceSdDocument"),
+        ("referenceSalesOrderItem", "referenceSdDocumentItem"),
+        ("deliveredQuantity",       "actualDeliveryQuantity"),
+        ("plant",                   "plant"),
+    ],
+    "billing_document_headers": [
+        ("billingDocumentId", "billingDocument"),
+        ("billingDate",       "billingDocumentDate"),
+        ("billingType",       "billingDocumentType"),
+        ("customerId",        "soldToParty"),
+        ("totalNetAmount",    "totalNetAmount"),
+        ("currency",          "transactionCurrency"),
+        ("isCancelled",       None),          # computed: bool → 0/1
+    ],
+    "billing_document_items": [
+        ("billingDocumentId",   "billingDocument"),
+        ("itemPosition",        "billingDocumentItem"),
+        ("referenceDeliveryId", "referenceSdDocument"),
+        ("referenceDeliveryItem", "referenceSdDocumentItem"),
+        ("billedAmount",        "netAmount"),
+        ("productId",           "material"),
+    ],
+    "billing_document_cancellations": [
+        # The cancellations folder contains S1-type docs.
+        # cancelledBillingDocument = the original F2 doc being reversed.
+        # billingDocument          = the S1 reversal doc itself.
+        ("cancelledBillingDocumentId",    "cancelledBillingDocument"),
+        ("cancellationBillingDocumentId", "billingDocument"),
+        ("cancellationDate",              "billingDocumentDate"),
+    ],
+    "journal_entry_items_accounts_receivable": [
+        # journalEntryId = accountingDocument (INSERT OR IGNORE → first item wins)
+        ("journalEntryId",             "accountingDocument"),
+        ("referenceBillingDocumentId", "referenceDocument"),
+        ("amount",                     "amountInTransactionCurrency"),
+        ("currency",                   "transactionCurrency"),
+        ("postingDate",                "postingDate"),
+        ("glAccount",                  "glAccount"),
+        ("profitCenter",               "profitCenter"),
+    ],
+    "payments_accounts_receivable": [
+        ("paymentId",               None),          # computed: doc + '_' + item
+        ("referenceJournalEntryId", "accountingDocument"),
+        ("paymentAmount",           "amountInTransactionCurrency"),
+        ("currency",                "transactionCurrency"),
+        ("paymentDate",             "clearingDate"),
+        ("customerId",              "customer"),
+    ],
+    "products": [
+        ("productId",   "product"),
+        ("productType", "productType"),
+        ("grossWeight", "grossWeight"),
+        ("weightUnit",  "weightUnit"),
+    ],
+    "product_descriptions": [
+        ("productId",   "product"),
+        ("language",    "language"),
+        ("productName", "productDescription"),
+    ],
+    "plants": [
+        ("plantId",           "plant"),
+        ("plantName",         "plantName"),
+        ("salesOrganization", "salesOrganization"),
+    ],
+}
+
+# ---------------------------------------------------------------------------
+# Row extractor
+# ---------------------------------------------------------------------------
+
+def _extract_row(table: str, record: dict) -> tuple:
+    """
+    Return a tuple of values (one per DB column) for a single JSONL record.
+    Missing JSONL keys are gracefully returned as None.
+    Computed fields (jsonl_key is None) are handled with table-specific logic.
+    """
+    result = []
+    for db_col, jsonl_key in TABLE_COLUMN_MAPS[table]:
+        if jsonl_key is not None:
+            result.append(record.get(jsonl_key))
+        # ── computed fields ──────────────────────────────────────────────
+        elif table == "billing_document_headers" and db_col == "isCancelled":
+            result.append(1 if record.get("billingDocumentIsCancelled") else 0)
+        elif table == "payments_accounts_receivable" and db_col == "paymentId":
+            doc  = record.get("accountingDocument", "")
+            item = record.get("accountingDocumentItem", "1") or "1"
+            result.append(f"{doc}_{item}")
+        else:
+            result.append(None)
+    return tuple(result)
 
 
-def read_jsonl_files(folder_name):
-    folder_path = os.path.join(DATASET_PATH, folder_name)
-    records = []
-    if not os.path.exists(folder_path):
-        print(f"Warning: folder '{folder_path}' does not exist, skipping.")
-        return records
-    for filename in sorted(os.listdir(folder_path)):
-        if filename.endswith(".jsonl"):
-            filepath = os.path.join(folder_path, filename)
-            with open(filepath, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        try:
-                            records.append(json.loads(line))
-                        except json.JSONDecodeError:
-                            pass
-    return records
+# ---------------------------------------------------------------------------
+# Core ingestion routine
+# ---------------------------------------------------------------------------
+
+def ingest_table(conn: sqlite3.Connection, table: str, folder_path: str) -> int:
+    """
+    Stream all .jsonl shards in folder_path into the target table.
+    Uses INSERT OR IGNORE (duplicate PKs are silently skipped).
+    Returns total number of records attempted.
+    """
+    cols         = [col for col, _ in TABLE_COLUMN_MAPS[table]]
+    placeholders = ", ".join("?" * len(cols))
+    insert_sql   = (
+        f"INSERT OR IGNORE INTO {table} "
+        f"({', '.join(cols)}) "
+        f"VALUES ({placeholders})"
+    )
+
+    cursor      = conn.cursor()
+    grand_total = 0
+
+    for fname in sorted(os.listdir(folder_path)):
+        if not fname.endswith(".jsonl"):
+            continue
+
+        fpath      = os.path.join(folder_path, fname)
+        batch: list[tuple] = []
+        file_rows  = 0
+        errors     = 0
+
+        with open(fpath, "r", encoding="utf-8") as fh:
+            for raw_line in fh:
+                raw_line = raw_line.strip()
+                if not raw_line:
+                    continue
+                try:
+                    record = json.loads(raw_line)
+                    batch.append(_extract_row(table, record))
+                    file_rows += 1
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    errors += 1
+                    continue
+
+                if len(batch) >= CHUNK_SIZE:
+                    cursor.executemany(insert_sql, batch)
+                    conn.commit()
+                    batch.clear()
+
+        if batch:
+            cursor.executemany(insert_sql, batch)
+            conn.commit()
+
+        suffix = f"  ({errors} parse errors)" if errors else ""
+        print(f"    {fname:<50}  {file_rows:>6} records{suffix}")
+        grand_total += file_rows
+
+    return grand_total
 
 
-def ingest_customers(conn):
-    addresses = {}
-    for record in read_jsonl_files("business_partner_addresses"):
-        bp = record.get("businessPartner", "")
-        if bp:
-            addresses[bp] = {
-                "city": record.get("cityName", ""),
-                "country": record.get("country", ""),
-            }
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
-    cursor = conn.cursor()
-    count = 0
-    for record in read_jsonl_files("business_partners"):
-        bp = record.get("businessPartner", "")
-        addr = addresses.get(bp, {})
-        cursor.execute(
-            """INSERT OR IGNORE INTO customers
-               (business_partner, full_name, city, country)
-               VALUES (?, ?, ?, ?)""",
-            (
-                bp,
-                record.get("businessPartnerFullName", ""),
-                addr.get("city", ""),
-                addr.get("country", ""),
-            ),
+def main() -> None:
+    print("=" * 65)
+    print("SAP O2C Production Ingestion Pipeline")
+    print(f"Data source : {os.path.abspath(DATA_DIR)}")
+    print(f"Database    : {os.path.abspath(DB_PATH)}")
+    print("=" * 65)
+
+    if not os.path.isdir(DATA_DIR):
+        raise FileNotFoundError(
+            f"Dataset folder not found:\n  {DATA_DIR}\n"
+            "Please check the DATA_DIR path at the top of ingest.py."
         )
-        count += 1
-    conn.commit()
-    print(f"Ingested {count} rows into customers")
 
+    print("\nResetting database schema …")
+    reset_schema()
+    print("Schema ready.\n")
 
-def ingest_sales_order_headers(conn):
-    cursor = conn.cursor()
-    count = 0
-    for record in read_jsonl_files("sales_order_headers"):
-        cursor.execute(
-            """INSERT OR IGNORE INTO sales_order_headers
-               (sales_order, sold_to_party, creation_date, total_net_amount,
-                overall_delivery_status, transaction_currency)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (
-                record.get("salesOrder", ""),
-                record.get("soldToParty", ""),
-                record.get("creationDate", ""),
-                record.get("totalNetAmount"),
-                record.get("overallDeliveryStatus", ""),
-                record.get("transactionCurrency", ""),
-            ),
-        )
-        count += 1
-    conn.commit()
-    print(f"Ingested {count} rows into sales_order_headers")
+    # Open a single connection for the whole pipeline
+    conn = sqlite3.connect(DB_PATH)
 
+    grand_total = 0
+    tables_processed = 0
+    tables_skipped   = 0
 
-def ingest_sales_order_items(conn):
-    cursor = conn.cursor()
-    count = 0
-    for record in read_jsonl_files("sales_order_items"):
-        cursor.execute(
-            """INSERT OR IGNORE INTO sales_order_items
-               (sales_order, sales_order_item, material, requested_quantity, net_amount)
-               VALUES (?, ?, ?, ?, ?)""",
-            (
-                record.get("salesOrder", ""),
-                record.get("salesOrderItem", ""),
-                record.get("material", ""),
-                record.get("requestedQuantity"),
-                record.get("netAmount"),
-            ),
-        )
-        count += 1
-    conn.commit()
-    print(f"Ingested {count} rows into sales_order_items")
+    for table in sorted(TABLE_COLUMN_MAPS.keys()):
+        folder = os.path.join(DATA_DIR, table)
+        if not os.path.isdir(folder):
+            print(f"[SKIP]  {table}  (no matching folder found)")
+            tables_skipped += 1
+            continue
 
+        print(f"[{table}]")
+        count = ingest_table(conn, table, folder)
+        print(f"  ↳  {count} rows ingested into {table}\n")
+        grand_total   += count
+        tables_processed += 1
 
-def ingest_delivery_headers(conn):
-    cursor = conn.cursor()
-    count = 0
-    for record in read_jsonl_files("outbound_delivery_headers"):
-        cursor.execute(
-            """INSERT OR IGNORE INTO delivery_headers
-               (delivery_document, creation_date, shipping_point, overall_goods_movement_status)
-               VALUES (?, ?, ?, ?)""",
-            (
-                record.get("deliveryDocument", ""),
-                record.get("creationDate", ""),
-                record.get("shippingPoint", ""),
-                record.get("overallGoodsMovementStatus", ""),
-            ),
-        )
-        count += 1
-    conn.commit()
-    print(f"Ingested {count} rows into delivery_headers")
+    conn.close()
 
-
-def ingest_delivery_items(conn):
-    cursor = conn.cursor()
-    count = 0
-    for record in read_jsonl_files("outbound_delivery_items"):
-        cursor.execute(
-            """INSERT OR IGNORE INTO delivery_items
-               (delivery_document, delivery_document_item, reference_sd_document,
-                reference_sd_document_item, plant, storage_location)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (
-                record.get("deliveryDocument", ""),
-                record.get("deliveryDocumentItem", ""),
-                record.get("referenceSdDocument", ""),
-                record.get("referenceSdDocumentItem", ""),
-                record.get("plant", ""),
-                record.get("storageLocation", ""),
-            ),
-        )
-        count += 1
-    conn.commit()
-    print(f"Ingested {count} rows into delivery_items")
-
-
-def ingest_billing_headers(conn):
-    cursor = conn.cursor()
-    count = 0
-    for record in read_jsonl_files("billing_document_headers"):
-        cursor.execute(
-            """INSERT OR IGNORE INTO billing_headers
-               (billing_document, billing_document_type, creation_date, billing_document_date,
-                total_net_amount, sold_to_party, transaction_currency, billing_document_is_cancelled)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                record.get("billingDocument", ""),
-                record.get("billingDocumentType", ""),
-                record.get("creationDate", ""),
-                record.get("billingDocumentDate", ""),
-                record.get("totalNetAmount"),
-                record.get("soldToParty", ""),
-                record.get("transactionCurrency", ""),
-                1 if record.get("billingDocumentIsCancelled") else 0,
-            ),
-        )
-        count += 1
-
-    cancel_count = 0
-    for record in read_jsonl_files("billing_document_cancellations"):
-        cursor.execute(
-            """INSERT OR IGNORE INTO billing_headers
-               (billing_document, billing_document_type, creation_date, billing_document_date,
-                total_net_amount, sold_to_party, transaction_currency, billing_document_is_cancelled)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                record.get("billingDocument", ""),
-                record.get("billingDocumentType", ""),
-                record.get("creationDate", ""),
-                record.get("billingDocumentDate", ""),
-                record.get("totalNetAmount"),
-                record.get("soldToParty", ""),
-                record.get("transactionCurrency", ""),
-                1,
-            ),
-        )
-        cancel_count += 1
-
-    conn.commit()
-    print(f"Ingested {count} rows into billing_headers (+ {cancel_count} cancellations)")
-
-
-def ingest_billing_items(conn):
-    cursor = conn.cursor()
-    count = 0
-    for record in read_jsonl_files("billing_document_items"):
-        cursor.execute(
-            """INSERT OR IGNORE INTO billing_items
-               (billing_document, billing_document_item, material, billing_quantity,
-                net_amount, reference_sd_document, reference_sd_document_item)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (
-                record.get("billingDocument", ""),
-                record.get("billingDocumentItem", ""),
-                record.get("material", ""),
-                record.get("billingQuantity"),
-                record.get("netAmount"),
-                record.get("referenceSdDocument", ""),
-                record.get("referenceSdDocumentItem", ""),
-            ),
-        )
-        count += 1
-    conn.commit()
-    print(f"Ingested {count} rows into billing_items")
-
-
-def ingest_journal_entries(conn):
-    cursor = conn.cursor()
-    count = 0
-    for record in read_jsonl_files("journal_entry_items_accounts_receivable"):
-        cursor.execute(
-            """INSERT OR IGNORE INTO journal_entries
-               (accounting_document, accounting_document_item, reference_document, gl_account,
-                amount_in_transaction_currency, transaction_currency, posting_date, profit_center)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                record.get("accountingDocument", ""),
-                record.get("accountingDocumentItem") or "1",
-                record.get("referenceDocument", ""),
-                record.get("glAccount", ""),
-                record.get("amountInTransactionCurrency"),
-                record.get("transactionCurrency", ""),
-                record.get("postingDate", ""),
-                record.get("profitCenter", ""),
-            ),
-        )
-        count += 1
-    conn.commit()
-    print(f"Ingested {count} rows into journal_entries")
-
-
-def ingest_payments(conn):
-    cursor = conn.cursor()
-    count = 0
-    for record in read_jsonl_files("payments_accounts_receivable"):
-        cursor.execute(
-            """INSERT OR IGNORE INTO payments
-               (accounting_document, accounting_document_item, customer, clearing_date,
-                clearing_accounting_document, amount_in_transaction_currency,
-                transaction_currency, invoice_reference)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                record.get("accountingDocument", ""),
-                record.get("accountingDocumentItem", ""),
-                record.get("customer", ""),
-                record.get("clearingDate", ""),
-                record.get("clearingAccountingDocument", ""),
-                record.get("amountInTransactionCurrency"),
-                record.get("transactionCurrency", ""),
-                record.get("invoiceReference", ""),
-            ),
-        )
-        count += 1
-    conn.commit()
-    print(f"Ingested {count} rows into payments")
-
-
-def ingest_products(conn):
-    descriptions = {}
-    for record in read_jsonl_files("product_descriptions"):
-        if record.get("language", "") == "EN":
-            product = record.get("product", "")
-            if product:
-                descriptions[product] = record.get("productDescription", "")
-
-    cursor = conn.cursor()
-    count = 0
-    for record in read_jsonl_files("products"):
-        product = record.get("product", "")
-        cursor.execute(
-            """INSERT OR IGNORE INTO products
-               (product, product_type, gross_weight, weight_unit, product_description)
-               VALUES (?, ?, ?, ?, ?)""",
-            (
-                product,
-                record.get("productType", ""),
-                record.get("grossWeight"),
-                record.get("weightUnit", ""),
-                descriptions.get(product, ""),
-            ),
-        )
-        count += 1
-    conn.commit()
-    print(f"Ingested {count} rows into products")
-
-
-def ingest_plants(conn):
-    cursor = conn.cursor()
-    count = 0
-    for record in read_jsonl_files("plants"):
-        cursor.execute(
-            """INSERT OR IGNORE INTO plants
-               (plant, plant_name, sales_organization)
-               VALUES (?, ?, ?)""",
-            (
-                record.get("plant", ""),
-                record.get("plantName", ""),
-                record.get("salesOrganization", ""),
-            ),
-        )
-        count += 1
-    conn.commit()
-    print(f"Ingested {count} rows into plants")
-
-
-def main():
-    print("Initializing database...")
-    init_db()
-    conn = get_db()
-    try:
-        ingest_customers(conn)
-        ingest_sales_order_headers(conn)
-        ingest_sales_order_items(conn)
-        ingest_delivery_headers(conn)
-        ingest_delivery_items(conn)
-        ingest_billing_headers(conn)
-        ingest_billing_items(conn)
-        ingest_journal_entries(conn)
-        ingest_payments(conn)
-        ingest_products(conn)
-        ingest_plants(conn)
-        print("Ingestion complete!")
-    finally:
-        conn.close()
+    print("=" * 65)
+    print(f"Tables processed : {tables_processed}")
+    print(f"Tables skipped   : {tables_skipped}")
+    print(f"Total rows       : {grand_total:,}")
+    print("=" * 65)
 
 
 if __name__ == "__main__":

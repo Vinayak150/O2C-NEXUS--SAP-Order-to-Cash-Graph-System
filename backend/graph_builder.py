@@ -1,216 +1,232 @@
+import datetime
+from decimal import Decimal
+
 import networkx as nx
 
 from database import get_db
 
 
-def build_graph():
+# ---------------------------------------------------------------------------
+# Serialisation helper
+# ---------------------------------------------------------------------------
+
+def sanitize_row(row) -> dict:
+    """
+    Convert a sqlite3.Row (or any mapping) to a plain dict, coercing every
+    value to a JSON-safe Python primitive so graph_to_json never raises
+    a TypeError.
+
+    SQLite native types are already JSON-safe (str / int / float / None).
+    Guards are present for datetime and Decimal in case a third-party
+    adapter or future schema migration introduces them.
+    """
+    result: dict = {}
+    for key in row.keys():
+        val = row[key]
+        if val is None:
+            result[key] = None
+        elif isinstance(val, (datetime.date, datetime.datetime)):
+            result[key] = val.isoformat()
+        elif isinstance(val, Decimal):
+            result[key] = float(val)
+        elif isinstance(val, bytes):
+            result[key] = val.decode("utf-8", errors="replace")
+        elif isinstance(val, (int, float, str, bool)):
+            result[key] = val
+        else:
+            result[key] = str(val)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Graph builder
+# ---------------------------------------------------------------------------
+
+def build_graph() -> nx.DiGraph:
     conn = get_db()
     G = nx.DiGraph()
     cursor = conn.cursor()
 
-    # --- NODES ---
+    # -----------------------------------------------------------------------
+    # NODES  — SELECT * so every column becomes a tooltip-visible attribute.
+    #          type and label are injected after sanitize_row so they always
+    #          win over any hypothetical same-named DB column.
+    # -----------------------------------------------------------------------
 
-    cursor.execute("SELECT business_partner, full_name, city, country FROM customers")
+    # --- Customers (business_partners) ---
+    cursor.execute("SELECT * FROM business_partners")
     for row in cursor.fetchall():
-        G.add_node(
-            f"customer_{row['business_partner']}",
-            type="Customer",
-            label=row["full_name"] or row["business_partner"],
-            city=row["city"],
-            country=row["country"],
-        )
+        attrs = sanitize_row(row)
+        attrs["type"] = "Customer"
+        attrs["label"] = attrs.get("fullName") or attrs["businessPartnerId"]
+        G.add_node(f"customer_{attrs['businessPartnerId']}", **attrs)
 
+    # --- Sales Orders ---
+    cursor.execute("SELECT * FROM sales_order_headers")
+    for row in cursor.fetchall():
+        attrs = sanitize_row(row)
+        attrs["type"] = "SalesOrder"
+        attrs["label"] = f"SO {attrs['salesOrderId']}"
+        G.add_node(f"so_{attrs['salesOrderId']}", **attrs)
+
+    # --- Deliveries ---
+    cursor.execute("SELECT * FROM outbound_delivery_headers")
+    for row in cursor.fetchall():
+        attrs = sanitize_row(row)
+        attrs["type"] = "Delivery"
+        attrs["label"] = f"DEL {attrs['deliveryId']}"
+        G.add_node(f"del_{attrs['deliveryId']}", **attrs)
+
+    # --- Billing Documents ---
+    cursor.execute("SELECT * FROM billing_document_headers")
+    for row in cursor.fetchall():
+        attrs = sanitize_row(row)
+        attrs["type"] = "BillingDocument"
+        attrs["label"] = f"BILL {attrs['billingDocumentId']}"
+        G.add_node(f"bill_{attrs['billingDocumentId']}", **attrs)
+
+    # --- Journal Entries  (prefix: je_) ---
+    cursor.execute("SELECT * FROM journal_entry_items_accounts_receivable")
+    for row in cursor.fetchall():
+        attrs = sanitize_row(row)
+        attrs["type"] = "JournalEntry"
+        attrs["label"] = f"JE {attrs['journalEntryId']}"
+        G.add_node(f"je_{attrs['journalEntryId']}", **attrs)
+
+    # --- Payments  (prefix: pay_) ---
+    cursor.execute("SELECT * FROM payments_accounts_receivable")
+    for row in cursor.fetchall():
+        attrs = sanitize_row(row)
+        attrs["type"] = "Payment"
+        attrs["label"] = f"PAY {attrs['paymentId']}"
+        G.add_node(f"pay_{attrs['paymentId']}", **attrs)
+
+    # --- Products  (prefix: prod_)
+    #     LEFT JOIN product_descriptions to surface the human-readable name.
     cursor.execute(
-        """SELECT sales_order, sold_to_party, total_net_amount, transaction_currency,
-                  creation_date, overall_delivery_status
-           FROM sales_order_headers"""
+        """SELECT p.*, pd.productName
+           FROM products p
+           LEFT JOIN product_descriptions pd
+               ON pd.productId = p.productId AND pd.language = 'EN'"""
     )
     for row in cursor.fetchall():
-        G.add_node(
-            f"so_{row['sales_order']}",
-            type="SalesOrder",
-            label=f"SO {row['sales_order']}",
-            amount=row["total_net_amount"],
-            currency=row["transaction_currency"],
-            creation_date=row["creation_date"],
-            delivery_status=row["overall_delivery_status"],
-        )
+        attrs = sanitize_row(row)
+        attrs["type"] = "Product"
+        attrs["label"] = attrs.get("productName") or attrs["productId"]
+        G.add_node(f"prod_{attrs['productId']}", **attrs)
 
+    # --- Plants ---
+    cursor.execute("SELECT * FROM plants")
+    for row in cursor.fetchall():
+        attrs = sanitize_row(row)
+        attrs["type"] = "Plant"
+        attrs["label"] = attrs.get("plantName") or attrs["plantId"]
+        G.add_node(f"plant_{attrs['plantId']}", **attrs)
+
+    # -----------------------------------------------------------------------
+    # EDGES
+    # -----------------------------------------------------------------------
+
+    # 1. SalesOrder –[HAS_ITEM]–► Product
+    #    sales_order_items: salesOrderId → productId
     cursor.execute(
-        """SELECT delivery_document, creation_date, overall_goods_movement_status
-           FROM delivery_headers"""
+        """SELECT DISTINCT salesOrderId, productId FROM sales_order_items
+           WHERE productId IS NOT NULL AND productId != ''"""
     )
     for row in cursor.fetchall():
-        G.add_node(
-            f"del_{row['delivery_document']}",
-            type="Delivery",
-            label=f"DEL {row['delivery_document']}",
-            creation_date=row["creation_date"],
-            goods_movement_status=row["overall_goods_movement_status"],
-        )
-
-    cursor.execute(
-        """SELECT billing_document, total_net_amount, transaction_currency,
-                  billing_document_is_cancelled, billing_document_type
-           FROM billing_headers"""
-    )
-    for row in cursor.fetchall():
-        G.add_node(
-            f"bill_{row['billing_document']}",
-            type="BillingDocument",
-            label=f"BILL {row['billing_document']}",
-            amount=row["total_net_amount"],
-            currency=row["transaction_currency"],
-            is_cancelled=row["billing_document_is_cancelled"],
-            billing_document_type=row["billing_document_type"],
-        )
-
-    cursor.execute("SELECT DISTINCT accounting_document FROM journal_entries")
-    for row in cursor.fetchall():
-        G.add_node(
-            f"journal_{row['accounting_document']}",
-            type="JournalEntry",
-            label=f"JE {row['accounting_document']}",
-        )
-
-    cursor.execute(
-        """SELECT accounting_document, accounting_document_item,
-                  amount_in_transaction_currency, transaction_currency, clearing_date
-           FROM payments"""
-    )
-    for row in cursor.fetchall():
-        G.add_node(
-            f"payment_{row['accounting_document']}_{row['accounting_document_item']}",
-            type="Payment",
-            label=f"PAY {row['accounting_document']}",
-            amount=row["amount_in_transaction_currency"],
-            currency=row["transaction_currency"],
-            clearing_date=row["clearing_date"],
-        )
-
-    cursor.execute("SELECT product, product_type, product_description FROM products")
-    for row in cursor.fetchall():
-        G.add_node(
-            f"product_{row['product']}",
-            type="Product",
-            label=row["product_description"] or row["product"],
-            product_type=row["product_type"],
-        )
-
-    cursor.execute("SELECT plant, plant_name, sales_organization FROM plants")
-    for row in cursor.fetchall():
-        G.add_node(
-            f"plant_{row['plant']}",
-            type="Plant",
-            label=row["plant_name"] or row["plant"],
-            plant_code=row["plant"],
-        )
-
-    # --- EDGES ---
-
-    # 1. Customer PLACED SalesOrder
-    cursor.execute("SELECT sold_to_party, sales_order FROM sales_order_headers")
-    for row in cursor.fetchall():
-        src = f"customer_{row['sold_to_party']}"
-        dst = f"so_{row['sales_order']}"
+        src = f"so_{row['salesOrderId']}"
+        dst = f"prod_{row['productId']}"
         if src in G and dst in G:
-            G.add_edge(src, dst, relation="PLACED")
+            G.add_edge(src, dst, relation="HAS_ITEM")
 
-    # 2. SalesOrder CONTAINS Product (via sales_order_items.material)
+    # 2. SalesOrder –[DELIVERED_IN]–► Delivery
+    #    outbound_delivery_items: referenceSalesOrderId → deliveryId
     cursor.execute(
-        """SELECT DISTINCT sales_order, material FROM sales_order_items
-           WHERE material IS NOT NULL AND material != ''"""
+        """SELECT DISTINCT referenceSalesOrderId, deliveryId
+           FROM outbound_delivery_items
+           WHERE referenceSalesOrderId IS NOT NULL AND referenceSalesOrderId != ''"""
     )
     for row in cursor.fetchall():
-        src = f"so_{row['sales_order']}"
-        dst = f"product_{row['material']}"
+        src = f"so_{row['referenceSalesOrderId']}"
+        dst = f"del_{row['deliveryId']}"
         if src in G and dst in G:
-            G.add_edge(src, dst, relation="CONTAINS")
+            G.add_edge(src, dst, relation="DELIVERED_IN")
 
-    # 3. SalesOrder HAS_DELIVERY Delivery
-    #    delivery_items.reference_sd_document = sales_order_headers.sales_order
+    # 3. Delivery –[BILLED_IN]–► BillingDocument
+    #    billing_document_items: referenceDeliveryId → billingDocumentId
     cursor.execute(
-        """SELECT DISTINCT reference_sd_document, delivery_document FROM delivery_items
-           WHERE reference_sd_document IS NOT NULL AND reference_sd_document != ''"""
+        """SELECT DISTINCT referenceDeliveryId, billingDocumentId
+           FROM billing_document_items
+           WHERE referenceDeliveryId IS NOT NULL AND referenceDeliveryId != ''"""
     )
     for row in cursor.fetchall():
-        src = f"so_{row['reference_sd_document']}"
-        dst = f"del_{row['delivery_document']}"
-        if src in G and dst in G:
-            G.add_edge(src, dst, relation="HAS_DELIVERY")
-
-    # 4. Delivery BILLED_IN BillingDocument
-    #    O2C FIX: billing_items.reference_sd_document = delivery_headers.delivery_document
-    cursor.execute(
-        """SELECT DISTINCT reference_sd_document, billing_document FROM billing_items
-           WHERE reference_sd_document IS NOT NULL AND reference_sd_document != ''"""
-    )
-    for row in cursor.fetchall():
-        src = f"del_{row['reference_sd_document']}"
-        dst = f"bill_{row['billing_document']}"
+        src = f"del_{row['referenceDeliveryId']}"
+        dst = f"bill_{row['billingDocumentId']}"
         if src in G and dst in G:
             G.add_edge(src, dst, relation="BILLED_IN")
 
-    # 5. BillingDocument GENERATES JournalEntry
-    #    journal_entries.reference_document = billing_headers.billing_document
+    # 4. BillingDocument –[POSTED_TO]–► JournalEntry
+    #    journal_entry_items_accounts_receivable: referenceBillingDocumentId → journalEntryId
     cursor.execute(
-        """SELECT DISTINCT reference_document, accounting_document FROM journal_entries
-           WHERE reference_document IS NOT NULL AND reference_document != ''"""
+        """SELECT DISTINCT referenceBillingDocumentId, journalEntryId
+           FROM journal_entry_items_accounts_receivable
+           WHERE referenceBillingDocumentId IS NOT NULL
+             AND referenceBillingDocumentId != ''"""
     )
     for row in cursor.fetchall():
-        src = f"bill_{row['reference_document']}"
-        dst = f"journal_{row['accounting_document']}"
+        src = f"bill_{row['referenceBillingDocumentId']}"
+        dst = f"je_{row['journalEntryId']}"
         if src in G and dst in G:
-            G.add_edge(src, dst, relation="GENERATES")
+            G.add_edge(src, dst, relation="POSTED_TO")
 
-    # 6. JournalEntry CLEARED_BY Payment
-    #    payments.accounting_document = journal_entries.accounting_document
+    # 5. JournalEntry –[PAID_BY]–► Payment
+    #    payments_accounts_receivable: referenceJournalEntryId → paymentId
     cursor.execute(
-        """SELECT DISTINCT je.accounting_document,
-                  p.accounting_document AS pay_doc,
-                  p.accounting_document_item
-           FROM journal_entries je
-           JOIN payments p ON je.accounting_document = p.accounting_document"""
+        """SELECT DISTINCT referenceJournalEntryId, paymentId
+           FROM payments_accounts_receivable
+           WHERE referenceJournalEntryId IS NOT NULL
+             AND referenceJournalEntryId != ''"""
     )
     for row in cursor.fetchall():
-        src = f"journal_{row['accounting_document']}"
-        dst = f"payment_{row['pay_doc']}_{row['accounting_document_item']}"
+        src = f"je_{row['referenceJournalEntryId']}"
+        dst = f"pay_{row['paymentId']}"
         if src in G and dst in G:
-            G.add_edge(src, dst, relation="CLEARED_BY")
+            G.add_edge(src, dst, relation="PAID_BY")
 
-    # 7. Delivery SHIPPED_FROM Plant (delivery_items.plant)
+    # 6. BillingDocument –[CANCELLED_BY]–► BillingDocument (S1 reversal)
+    #    billing_document_cancellations
     cursor.execute(
-        """SELECT DISTINCT delivery_document, plant FROM delivery_items
-           WHERE plant IS NOT NULL AND plant != ''"""
+        """SELECT cancelledBillingDocumentId, cancellationBillingDocumentId
+           FROM billing_document_cancellations
+           WHERE cancelledBillingDocumentId IS NOT NULL
+             AND cancellationBillingDocumentId IS NOT NULL"""
     )
     for row in cursor.fetchall():
-        src = f"del_{row['delivery_document']}"
-        dst = f"plant_{row['plant']}"
-        if src in G and dst in G:
-            G.add_edge(src, dst, relation="SHIPPED_FROM")
-
-    # S1 Cancellation edges: BillingDocument CANCELLED_BY BillingDocument(type=S1)
-    # billing_items for S1-type docs reference the original billing document
-    cursor.execute(
-        """SELECT bi.reference_sd_document AS original_doc,
-                  bi.billing_document AS cancel_doc
-           FROM billing_items bi
-           JOIN billing_headers bh ON bi.billing_document = bh.billing_document
-           WHERE bh.billing_document_type = 'S1'
-             AND bi.reference_sd_document IS NOT NULL
-             AND bi.reference_sd_document != ''"""
-    )
-    for row in cursor.fetchall():
-        src = f"bill_{row['original_doc']}"
-        dst = f"bill_{row['cancel_doc']}"
+        src = f"bill_{row['cancelledBillingDocumentId']}"
+        dst = f"bill_{row['cancellationBillingDocumentId']}"
         if src in G and dst in G:
             G.add_edge(src, dst, relation="CANCELLED_BY")
+
+    # -----------------------------------------------------------------------
+    # ADVANCED GRAPH ANALYSIS — Degree-based node sizing
+    # Inject a 'calculated_val' attribute onto every node so the frontend
+    # can scale node radius proportionally to its connection count.
+    # Formula: base size of 2 + 0.5 per connection (casted to float for
+    # JSON serialisation safety).
+    # -----------------------------------------------------------------------
+    degrees = dict(G.degree())
+    for node, degree in degrees.items():
+        G.nodes[node]['calculated_val'] = float(2.0 + (degree * 0.5))
 
     conn.close()
     return G
 
 
-def graph_to_json(G):
+# ---------------------------------------------------------------------------
+# JSON export
+# ---------------------------------------------------------------------------
+
+def graph_to_json(G: nx.DiGraph) -> dict:
     nodes = []
     for node_id, attrs in G.nodes(data=True):
         node_data = {"id": node_id}
@@ -223,33 +239,30 @@ def graph_to_json(G):
         link_data.update(attrs)
         links.append(link_data)
 
-    node_types = {}
+    node_types: dict = {}
     for node in nodes:
         t = node.get("type", "Unknown")
         node_types[t] = node_types.get(t, 0) + 1
 
+    # Cap at 2000 nodes for frontend performance, sampling evenly across types
     if len(nodes) > 2000:
-        type_buckets = {}
+        type_buckets: dict = {}
         for node in nodes:
             t = node.get("type", "Unknown")
-            if t not in type_buckets:
-                type_buckets[t] = []
-            type_buckets[t].append(node)
+            type_buckets.setdefault(t, []).append(node)
+        per_type_limit = max(1, 2000 // len(type_buckets))
+        sampled: list = []
+        for type_nodes in type_buckets.values():
+            sampled.extend(type_nodes[:per_type_limit])
+        nodes = sampled[:2000]
 
-        total_types = len(type_buckets)
-        per_type_limit = max(1, 2000 // total_types)
-        sampled_nodes = []
-        for t, type_nodes in type_buckets.items():
-            sampled_nodes.extend(type_nodes[:per_type_limit])
-        nodes = sampled_nodes[:2000]
-
+    # Drop edges whose endpoints were sampled out
     if len(links) > 5000:
         node_id_set = {n["id"] for n in nodes}
-        filtered_links = [
+        links = [
             lnk for lnk in links
             if lnk["source"] in node_id_set and lnk["target"] in node_id_set
-        ]
-        links = filtered_links[:5000]
+        ][:5000]
 
     return {
         "nodes": nodes,

@@ -3,122 +3,206 @@ import os
 
 DB_PATH = "data/o2c.db"
 
+# ---------------------------------------------------------------------------
+# Shared DDL — used by both init_db() and reset_schema()
+# ---------------------------------------------------------------------------
+_SCHEMA_DDL = """
+    -- 1. Business Partners
+    CREATE TABLE IF NOT EXISTS business_partners (
+        businessPartnerId TEXT PRIMARY KEY,
+        partnerType       TEXT,
+        fullName          TEXT
+    );
 
-def get_db():
+    -- 2. Business Partner Addresses
+    CREATE TABLE IF NOT EXISTS business_partner_addresses (
+        addressId         TEXT PRIMARY KEY,
+        businessPartnerId TEXT NOT NULL,
+        city              TEXT,
+        country           TEXT,
+        postalCode        TEXT,
+        streetName        TEXT
+    );
+
+    -- 3. Sales Order Headers
+    CREATE TABLE IF NOT EXISTS sales_order_headers (
+        salesOrderId        TEXT PRIMARY KEY,
+        customerId          TEXT,
+        salesOrganization   TEXT,
+        distributionChannel TEXT,
+        division            TEXT,
+        creationDate        TEXT,
+        overallStatus       TEXT,
+        totalNetAmount      REAL,
+        currency            TEXT
+    );
+
+    -- 4. Sales Order Items
+    CREATE TABLE IF NOT EXISTS sales_order_items (
+        salesOrderId  TEXT,
+        itemPosition  TEXT,
+        productId     TEXT,
+        orderQuantity REAL,
+        netAmount     REAL,
+        PRIMARY KEY (salesOrderId, itemPosition)
+    );
+
+    -- 5. Outbound Delivery Headers
+    CREATE TABLE IF NOT EXISTS outbound_delivery_headers (
+        deliveryId          TEXT PRIMARY KEY,
+        shippingPoint       TEXT,
+        deliveryDate        TEXT,
+        goodsMovementStatus TEXT
+    );
+
+    -- 6. Outbound Delivery Items
+    CREATE TABLE IF NOT EXISTS outbound_delivery_items (
+        deliveryId              TEXT,
+        itemPosition            TEXT,
+        referenceSalesOrderId   TEXT,
+        referenceSalesOrderItem TEXT,
+        deliveredQuantity       REAL,
+        plant                   TEXT,
+        PRIMARY KEY (deliveryId, itemPosition)
+    );
+
+    -- 7. Billing Document Headers
+    CREATE TABLE IF NOT EXISTS billing_document_headers (
+        billingDocumentId  TEXT PRIMARY KEY,
+        billingDate        TEXT,
+        billingType        TEXT,
+        customerId         TEXT,
+        totalNetAmount     REAL,
+        currency           TEXT,
+        isCancelled        INTEGER DEFAULT 0
+    );
+
+    -- 8. Billing Document Items
+    CREATE TABLE IF NOT EXISTS billing_document_items (
+        billingDocumentId    TEXT,
+        itemPosition         TEXT,
+        referenceDeliveryId  TEXT,
+        referenceDeliveryItem TEXT,
+        billedAmount         REAL,
+        productId            TEXT,
+        PRIMARY KEY (billingDocumentId, itemPosition)
+    );
+
+    -- 9. Billing Document Cancellations
+    CREATE TABLE IF NOT EXISTS billing_document_cancellations (
+        cancelledBillingDocumentId    TEXT,
+        cancellationBillingDocumentId TEXT,
+        cancellationDate              TEXT,
+        PRIMARY KEY (cancelledBillingDocumentId, cancellationBillingDocumentId)
+    );
+
+    -- 10. Journal Entry Items (Accounts Receivable)
+    CREATE TABLE IF NOT EXISTS journal_entry_items_accounts_receivable (
+        journalEntryId             TEXT PRIMARY KEY,
+        referenceBillingDocumentId TEXT,
+        amount                     REAL,
+        currency                   TEXT,
+        postingDate                TEXT,
+        glAccount                  TEXT,
+        profitCenter               TEXT
+    );
+
+    -- 11. Payments (Accounts Receivable)
+    CREATE TABLE IF NOT EXISTS payments_accounts_receivable (
+        paymentId              TEXT PRIMARY KEY,
+        referenceJournalEntryId TEXT,
+        paymentAmount          REAL,
+        currency               TEXT,
+        paymentDate            TEXT,
+        customerId             TEXT
+    );
+
+    -- 12. Products
+    CREATE TABLE IF NOT EXISTS products (
+        productId   TEXT PRIMARY KEY,
+        productType TEXT,
+        grossWeight REAL,
+        weightUnit  TEXT
+    );
+
+    -- 13. Product Descriptions
+    CREATE TABLE IF NOT EXISTS product_descriptions (
+        productId   TEXT,
+        language    TEXT,
+        productName TEXT,
+        PRIMARY KEY (productId, language)
+    );
+
+    -- 14. Plants
+    CREATE TABLE IF NOT EXISTS plants (
+        plantId          TEXT PRIMARY KEY,
+        plantName        TEXT,
+        salesOrganization TEXT
+    );
+"""
+
+_DROP_ALL_DDL = """
+    -- Legacy table names (old snake_case schema)
+    DROP TABLE IF EXISTS customers;
+    DROP TABLE IF EXISTS delivery_headers;
+    DROP TABLE IF EXISTS delivery_items;
+    DROP TABLE IF EXISTS billing_headers;
+    DROP TABLE IF EXISTS billing_items;
+    DROP TABLE IF EXISTS journal_entries;
+    DROP TABLE IF EXISTS payments;
+
+    -- Current camelCase tables
+    DROP TABLE IF EXISTS business_partners;
+    DROP TABLE IF EXISTS business_partner_addresses;
+    DROP TABLE IF EXISTS sales_order_headers;
+    DROP TABLE IF EXISTS sales_order_items;
+    DROP TABLE IF EXISTS outbound_delivery_headers;
+    DROP TABLE IF EXISTS outbound_delivery_items;
+    DROP TABLE IF EXISTS billing_document_headers;
+    DROP TABLE IF EXISTS billing_document_items;
+    DROP TABLE IF EXISTS billing_document_cancellations;
+    DROP TABLE IF EXISTS journal_entry_items_accounts_receivable;
+    DROP TABLE IF EXISTS payments_accounts_receivable;
+    DROP TABLE IF EXISTS products;
+    DROP TABLE IF EXISTS product_descriptions;
+    DROP TABLE IF EXISTS plants;
+"""
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def get_db() -> sqlite3.Connection:
+    """Return an open connection with sqlite3.Row factory."""
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def init_db():
+def init_db() -> None:
+    """
+    Create new-schema tables if they don't already exist.
+    Safe for server startup — does NOT drop data.
+    Call reset_schema() from ingest.py for a full migration.
+    """
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    cursor.executescript("""
-        CREATE TABLE IF NOT EXISTS customers (
-            business_partner TEXT PRIMARY KEY,
-            full_name TEXT,
-            city TEXT,
-            country TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS sales_order_headers (
-            sales_order TEXT PRIMARY KEY,
-            sold_to_party TEXT,
-            creation_date TEXT,
-            total_net_amount REAL,
-            overall_delivery_status TEXT,
-            transaction_currency TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS sales_order_items (
-            sales_order TEXT,
-            sales_order_item TEXT,
-            material TEXT,
-            requested_quantity REAL,
-            net_amount REAL,
-            PRIMARY KEY (sales_order, sales_order_item)
-        );
-
-        CREATE TABLE IF NOT EXISTS delivery_headers (
-            delivery_document TEXT PRIMARY KEY,
-            creation_date TEXT,
-            shipping_point TEXT,
-            overall_goods_movement_status TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS delivery_items (
-            delivery_document TEXT,
-            delivery_document_item TEXT,
-            reference_sd_document TEXT,
-            reference_sd_document_item TEXT,
-            plant TEXT,
-            storage_location TEXT,
-            PRIMARY KEY (delivery_document, delivery_document_item)
-        );
-
-        CREATE TABLE IF NOT EXISTS billing_headers (
-            billing_document TEXT PRIMARY KEY,
-            billing_document_type TEXT,
-            creation_date TEXT,
-            billing_document_date TEXT,
-            total_net_amount REAL,
-            sold_to_party TEXT,
-            transaction_currency TEXT,
-            billing_document_is_cancelled INTEGER
-        );
-
-        CREATE TABLE IF NOT EXISTS billing_items (
-            billing_document TEXT,
-            billing_document_item TEXT,
-            material TEXT,
-            billing_quantity REAL,
-            net_amount REAL,
-            reference_sd_document TEXT,
-            reference_sd_document_item TEXT,
-            PRIMARY KEY (billing_document, billing_document_item)
-        );
-
-        CREATE TABLE IF NOT EXISTS journal_entries (
-            accounting_document TEXT,
-            accounting_document_item TEXT,
-            reference_document TEXT,
-            gl_account TEXT,
-            amount_in_transaction_currency REAL,
-            transaction_currency TEXT,
-            posting_date TEXT,
-            profit_center TEXT,
-            PRIMARY KEY (accounting_document, accounting_document_item)
-        );
-
-        CREATE TABLE IF NOT EXISTS payments (
-            accounting_document TEXT,
-            accounting_document_item TEXT,
-            customer TEXT,
-            clearing_date TEXT,
-            clearing_accounting_document TEXT,
-            amount_in_transaction_currency REAL,
-            transaction_currency TEXT,
-            invoice_reference TEXT,
-            PRIMARY KEY (accounting_document, accounting_document_item)
-        );
-
-        CREATE TABLE IF NOT EXISTS products (
-            product TEXT PRIMARY KEY,
-            product_type TEXT,
-            gross_weight REAL,
-            weight_unit TEXT,
-            product_description TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS plants (
-            plant TEXT PRIMARY KEY,
-            plant_name TEXT,
-            sales_organization TEXT
-        );
-    """)
-
+    conn.executescript(_SCHEMA_DDL)
     conn.commit()
     conn.close()
+
+
+def reset_schema() -> None:
+    """
+    Drop ALL tables (old and new schema) then recreate the new schema.
+    Destroys all existing data — call only from ingest.py.
+    """
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.executescript(_DROP_ALL_DDL)
+    conn.executescript(_SCHEMA_DDL)
+    conn.commit()
+    conn.close()
+    print("Schema reset complete.")

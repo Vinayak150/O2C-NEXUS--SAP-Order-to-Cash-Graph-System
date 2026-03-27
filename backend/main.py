@@ -1,4 +1,5 @@
 import os
+from typing import Dict, List, Optional
 from dotenv import load_dotenv
 
 # Load environment variables at the absolute start
@@ -23,28 +24,21 @@ async def lifespan(app: FastAPI):
     GRAPH_DATA = graph_to_json(G)
     
     # Check if API Key is loaded successfully for the logs
-    api_key = os.getenv("GOOGLE_API_KEY")
+    api_key = os.getenv("GROQ_API_KEY")
     key_status = "LOADED" if api_key else "MISSING"
-    
+
     print(f"--- System Startup ---")
     print(f"Graph built: {len(GRAPH_DATA['nodes'])} nodes, {len(GRAPH_DATA['links'])} edges")
-    print(f"Gemini API Key: {key_status}")
+    print(f"Groq API Key: {key_status}")
     print(f"-----------------------")
     yield
 
 app = FastAPI(title="SAP O2C Graph API", lifespan=lifespan)
 
-# CORS — add your Vercel URL to ALLOWED_ORIGINS env var (comma-separated)
-_raw_origins = os.getenv(
-    "ALLOWED_ORIGINS",
-    "http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173",
-)
-_allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_allowed_origins,
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -68,12 +62,12 @@ def get_stats():
     cursor = conn.cursor()
 
     queries = {
-        "total_customers": "SELECT COUNT(*) AS count FROM customers",
+        "total_customers":    "SELECT COUNT(*) AS count FROM business_partners",
         "total_sales_orders": "SELECT COUNT(*) AS count FROM sales_order_headers",
-        "total_deliveries": "SELECT COUNT(*) AS count FROM delivery_headers",
-        "total_billing_docs": "SELECT COUNT(*) AS count FROM billing_headers",
-        "total_payments": "SELECT COUNT(*) AS count FROM payments",
-        "total_products": "SELECT COUNT(*) AS count FROM products",
+        "total_deliveries":   "SELECT COUNT(*) AS count FROM outbound_delivery_headers",
+        "total_billing_docs": "SELECT COUNT(*) AS count FROM billing_document_headers",
+        "total_payments":     "SELECT COUNT(*) AS count FROM payments_accounts_receivable",
+        "total_products":     "SELECT COUNT(*) AS count FROM products",
     }
 
     results = {}
@@ -86,13 +80,13 @@ def get_stats():
 
 class ChatRequest(BaseModel):
     message: str
+    chat_history: Optional[List[Dict[str, str]]] = []
 
 @app.post("/api/chat")
 def chat(request: ChatRequest):
     try:
         conn = get_db()
-        # Pass context to engine
-        result = answer_query(request.message, conn)
+        result = answer_query(request.message, conn, request.chat_history or [])
         conn.close()
         return result
     except Exception as e:

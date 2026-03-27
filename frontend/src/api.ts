@@ -1,4 +1,5 @@
-const BASE_URL = (import.meta as any).env?.VITE_API_URL ?? "http://localhost:8000/api";
+const BASE_URL: string =
+  (import.meta.env.VITE_API_URL as string) || "http://localhost:8000/api";
 
 export interface GraphNode {
   id: string;
@@ -17,6 +18,11 @@ export interface GraphData {
   nodes: GraphNode[];
   links: GraphLink[];
   stats: object;
+}
+
+export interface ChatHistoryItem {
+  role: "user" | "assistant";
+  content: string;
 }
 
 export interface ChatResponse {
@@ -51,13 +57,16 @@ export async function fetchNode(nodeId: string): Promise<GraphNode> {
   return response.json();
 }
 
-export async function sendChat(message: string): Promise<ChatResponse> {
+export async function sendChat(
+  message: string,
+  chatHistory: ChatHistoryItem[] = []
+): Promise<ChatResponse> {
   const response = await fetch(`${BASE_URL}/chat`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ message }),
+    body: JSON.stringify({ message, chat_history: chatHistory }),
   });
   if (!response.ok) {
     throw new Error(`Chat request failed: ${response.statusText}`);
